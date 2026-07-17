@@ -100,6 +100,10 @@ tests/                     CPU test suite (*_cpu.py)
 docs/                      Architecture notes, CLI/SDK guides
 ```
 
+For task-to-file and call-path pointers, use the
+[code navigation map](CODEMAP.md). This guide remains
+the source of working rules and repository conventions.
+
 ______________________________________________________________________
 
 ## Code style & patterns
