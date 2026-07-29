@@ -540,3 +540,114 @@ class TestCLI:
         # _best_tp_for_gpus(8) returns 8 (largest power-of-2 that divides 8)
         assert result.config["tp_size"].value == 8   # derived from _best_tp_for_gpus(8)
         assert any("no GPU detected" in w.lower() or "falling back" in w.lower() for w in result.warnings)
+
+
+# == boundary value tests ===================================================
+
+
+class TestBoundaryValues:
+    """Test extreme/boundary values for robustness."""
+
+    def test_very_large_model_235b_moe(self):
+        """Test memory estimation for very large MoE model (235B)."""
+        shape, note = gen.infer_shape_from_name("Qwen3-235B-A22B")
+        assert shape is not None
+        assert shape.is_moe is True
+        # Verify param count is correctly parsed
+        assert gen.parse_param_count_from_name("Qwen3-235B-A22B") == 235_000_000_000
+        # Memory estimation should not overflow
+        pc = gen.estimate_param_count(shape)
+        assert pc > 0
+        # Weight bytes should be reasonable (uses param_count_override if available)
+        weight_bytes = gen.estimate_weight_bytes(shape)
+        assert weight_bytes > 100_000_000_000  # > 100 GB (heuristic estimate for 235B)
+
+    def test_very_small_model_60m(self):
+        """Test memory estimation for very small model (60M)."""
+        shape, note = gen.infer_shape_from_name("tiny-60M")
+        assert shape is not None
+        pc = gen.estimate_param_count(shape)
+        assert pc == 60_000_000  # from override
+        weight_bytes = gen.estimate_weight_bytes(shape)
+        assert weight_bytes == 120_000_000  # 60M * 2 bytes
+
+    def test_extreme_context_len_128k(self):
+        """Test context length splitting with very large context (128k)."""
+        # RL algorithm: prompt = min(1024, 25%), response = remainder
+        prompt, new = gen.split_context_len("gspo", 131072)
+        assert prompt == 1024  # capped at 1024 for RL
+        assert new == 130048    # remainder
+
+        # DPO algorithm: 50/50 split
+        prompt, new = gen.split_context_len("dpo", 131072)
+        assert prompt == 65536
+        assert new == 65536
+
+    def test_extreme_batch_size_1(self):
+        """Test with minimum batch size of 1."""
+        result = gen.generate_recipe(
+            algo="sft", gpus=1, tp_size=1, context_len=512, batch_size=1
+        )
+        assert result.config["batch_size"].value == 1
+        assert result.config["mini_bs"].value == 1  # min(1, 16)
+
+    def test_extreme_batch_size_1024(self):
+        """Test with very large batch size."""
+        result = gen.generate_recipe(
+            algo="sft", gpus=8, tp_size=8, context_len=512, batch_size=1024
+        )
+        assert result.config["batch_size"].value == 1024
+        assert result.config["mini_bs"].value == 16  # min(1024, 16)
+
+    def test_single_gpu_setup(self):
+        """Test with single GPU (tp_size=1, world_size=1)."""
+        result = gen.generate_recipe(
+            algo="sft", gpus=1, tp_size=1, context_len=1024, batch_size=4
+        )
+        assert result.config["world_size"].value == 1
+        assert result.config["tp_size"].value == 1
+
+    def test_very_large_gpu_count_128(self):
+        """Test with very large GPU count."""
+        result = gen.generate_recipe(
+            algo="sft", gpus=128, tp_size=8, context_len=1024, batch_size=32
+        )
+        assert result.config["world_size"].value == 128
+        assert result.config["tp_size"].value == 8
+
+    def test_max_tp_size_equals_gpus(self):
+        """Test when tp_size equals world_size (no data parallelism)."""
+        result = gen.generate_recipe(
+            algo="sft", gpus=8, tp_size=8, context_len=1024, batch_size=16
+        )
+        assert result.config["world_size"].value == 8
+        assert result.config["tp_size"].value == 8
+        # dp_size = 8 // 8 = 1
+
+    def test_empty_dataset_path(self):
+        """Test with empty dataset path."""
+        result = gen.generate_recipe(
+            algo="sft", gpus=4, tp_size=2, context_len=1024, batch_size=8,
+            dataset_path=""
+        )
+        # Should use placeholder, not crash
+        assert result.config["dataset_path"].value == "<your-dataset>"
+
+    def test_very_long_model_name(self):
+        """Test with very long model name."""
+        long_name = "organization/" + "x" * 200 + "-7B-model-v1.0"
+        result = gen.generate_recipe(
+            algo="sft", gpus=4, tp_size=2, context_len=1024, batch_size=8,
+            ckpt=long_name
+        )
+        # Should handle long names gracefully
+        assert result.config["ckpt"].value == long_name
+
+    def test_special_chars_in_path(self):
+        """Test handling of special characters in paths."""
+        # This is more of a smoke test - the actual safety depends on shell escaping
+        result = gen.generate_recipe(
+            algo="sft", gpus=4, tp_size=2, context_len=1024, batch_size=8,
+            dataset_path="/path/with spaces/data.jsonl"
+        )
+        assert result.config["dataset_path"].value == "/path/with spaces/data.jsonl"
