@@ -806,11 +806,19 @@ def _build_command(algo: str, config_map: dict) -> str:
 
 
 def _count_dataset_rows(dataset_path: str) -> "int | None":
+    """Count rows in a dataset file or directory.
+
+    Supports .jsonl, .ndjson, .json (list), .csv files and directories of .jsonl files.
+    Uses generators for large files to avoid loading entire file into memory.
+    """
+    if not dataset_path:
+        return None
     p = Path(dataset_path)
     if not p.exists():
         return None
     if p.is_file():
         if p.suffix in {".jsonl", ".ndjson"}:
+            # Generator-based counting for memory efficiency with large files
             with p.open("r", encoding="utf-8") as f:
                 return sum(1 for _ in f)
         if p.suffix == ".json":
@@ -818,6 +826,7 @@ def _count_dataset_rows(dataset_path: str) -> "int | None":
                 data = json.load(f)
             return len(data) if isinstance(data, list) else None
         if p.suffix == ".csv":
+            # Generator-based counting for memory efficiency with large CSV files
             with p.open("r", encoding="utf-8") as f:
                 return max(sum(1 for _ in f) - 1, 0)
         return None

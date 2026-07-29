@@ -506,3 +506,37 @@ class TestCLI:
         # The "Could not read model config" warning is expected when areno
         # is not installed, but the generator still produces output via name inference.
         assert data["memory"] is not None
+
+    def test_auto_flag_produces_valid_output(self):
+        """Test --auto flag with fake GPU probe derives parameters automatically."""
+        # Use subprocess to test the CLI --auto flag with a fake GPU probe injected
+        # Since we can't inject FakeGpuProbe via CLI, we test the Python API directly
+        result = gen.generate_recipe(
+            algo="gspo", auto=True, ckpt="Qwen/Qwen3-0.6B",
+            reward_fn_path="r.py",
+            gpu_probe=_fake_gpu(80.0, 70.0)
+        )
+        # Verify auto-detection produced valid parameters
+        assert result.config["world_size"].value > 0
+        assert result.config["tp_size"].value > 0
+        assert result.config["batch_size"].value > 0
+        assert result.config["max_prompt_tokens"].value > 0
+        # Check that auto-detection note appears in warnings
+        assert any("Auto-detected" in w or "auto" in w.lower() for w in result.warnings)
+
+    def test_auto_mode_falls_back_when_no_gpu(self):
+        """Test --auto mode falls back to defaults when GPU probe returns None."""
+        # Create a probe that returns None (simulating no GPU)
+        class NoGpuProbe:
+            def probe(self):
+                return None
+
+        result = gen.generate_recipe(
+            algo="sft", auto=True,
+            gpu_probe=NoGpuProbe()
+        )
+        # Should fall back to defaults (gpus=8, tp_size derived from _best_tp_for_gpus(8)=8)
+        assert result.config["world_size"].value == 8  # default gpus
+        # _best_tp_for_gpus(8) returns 8 (largest power-of-2 that divides 8)
+        assert result.config["tp_size"].value == 8   # derived from _best_tp_for_gpus(8)
+        assert any("no GPU detected" in w.lower() or "falling back" in w.lower() for w in result.warnings)
