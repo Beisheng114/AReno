@@ -48,7 +48,7 @@ areno train --algo gspo --ckpt Qwen/Qwen3-0.6B ...
 
 | Parameter | Flag | Type | Default | Description |
 |-----------|------|------|---------|-------------|
-| GPU count | `--gpus` | int | 8 | Total GPU count, maps to `--world-size` |
+| GPU count | `--gpus` | int | 8 (auto-detected with `--auto`) | Total GPU count, maps to `--world-size` |
 | Tensor-parallel | `--tp-size` | int | 4 | Must divide `--gpus` |
 | Context length | `--context-len` | int | 2048 | Total prompt + response token budget |
 | Target batch | `--batch-size` | int | 8 | Prompt/pair batch size |
@@ -56,7 +56,7 @@ areno train --algo gspo --ckpt Qwen/Qwen3-0.6B ...
 | Dataset | `--dataset-path` | string | none | Dataset path for row counting |
 | Reward function | `--reward-fn-path` | string | none | Python file defining reward_fn(record) |
 | Rollout samples | `--n-samples` | int | 4 | Samples per prompt (RL only) |
-| Microbatch | `--mini-bs` | int | min(batch_size,16) | Training microbatch size |
+| Microbatch | `--mini-bs` | int | min(batch_size,16) | Training microbatch size; uses 16 as upper bound unless explicitly set |
 | 8-bit Adam | `--adam-8bit` | flag | off | Use 8-bit Adam optimizer states |
 | Activation checkpointing | `--no-activation-checkpointing` | flag | on | Disable layer activation recompute |
 | KV block size | `--block-size` | int | 256 | KV cache block size |
@@ -153,7 +153,7 @@ Probes free VRAM via `torch.cuda.mem_get_info` when available. When no GPU is de
 - Dataset row counting supports local `.jsonl`, `.json`, `.csv` files and directories of `.jsonl`
 - The generated command uses placeholder `<your-ckpt>` / `<your-dataset>` when those are not provided
 - Model-name inference covers Qwen3 (0.6B–72B), Llama (1B–70B), and Gemma (2B–27B)
-- `--auto` requires CUDA available
+- `--auto` works best with CUDA available; falls back gracefully on CPU-only environments
 
 ## Minimal Runnable Examples
 
@@ -198,11 +198,11 @@ python .agents/skills/areno-run-training/scripts/generate_recipe.py \
 
 ## Runtime Requirement Warnings
 
-The generator checks algorithm-specific required parameters and warns when missing (generation is not interrupted):
+The generator checks algorithm-specific required parameters and warns when missing (generation is not interrupted). These warnings indicate parameters needed at training runtime:
 
 | Algorithm | Required parameter |
 |-----------|-------------------|
-| SFT | `--dataset-loader-fn` |
+| SFT | `--dataset-loader-fn` (for custom dataset loading) |
 | GSPO/GRPO/PPO | `--reward-fn-path` or `--reward-ckpt` |
 | PPO | `--critic-ckpt` |
 | DPO | `--ref-ckpt` |
