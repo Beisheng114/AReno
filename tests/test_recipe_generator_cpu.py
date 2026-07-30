@@ -651,3 +651,166 @@ class TestBoundaryValues:
             dataset_path="/path/with spaces/data.jsonl"
         )
         assert result.config["dataset_path"].value == "/path/with spaces/data.jsonl"
+
+
+# == agentic RL parameters ================================================
+
+
+class TestAgenticParams:
+    """Tests for --agent-fn, --dataset-loader-fn, --agent-timeout-s, --train-tool-results."""
+
+    def test_all_agentic_params_combined(self):
+        result = gen.generate_recipe(
+            algo="grpo", gpus=1, tp_size=1, context_len=4096, batch_size=2,
+            ckpt="Qwen/Qwen3-0.6B", reward_fn_path="r.py",
+            agent_fn="a.py", dataset_loader_fn="dl.py",
+            agent_timeout_s=600.0, train_tool_results=True,
+        )
+        assert "--agent-fn a.py" in result.command
+        assert "--dataset-loader-fn dl.py" in result.command
+        assert "--agent-timeout-s 600.0" in result.command
+        assert result.config["agent_fn"].source == "explicit"
+        assert result.config["train_tool_results"].value is True
+
+    def test_agent_timeout_s_short_warning(self):
+        result = gen.generate_recipe(
+            algo="grpo", gpus=1, tp_size=1, context_len=4096, batch_size=2,
+            ckpt="Qwen/Qwen3-0.6B", reward_fn_path="r.py",
+            agent_fn="a.py", agent_timeout_s=30.0,
+        )
+        assert any("very short" in w for w in result.warnings)
+
+    def test_no_agent_fn_keeps_default_null(self):
+        result = gen.generate_recipe(
+            algo="grpo", gpus=1, tp_size=1, context_len=4096, batch_size=2,
+            ckpt="Qwen/Qwen3-0.6B", reward_fn_path="r.py",
+        )
+        assert result.config["agent_fn"].value is None
+        assert "--agent-fn" not in result.command
+
+
+# == multi-role memory estimation =========================================
+
+
+class TestMultiRoleMemory:
+    """Tests for PPO (critic+ref) and DPO (ref) extra memory estimation."""
+
+    def test_ppo_memory_higher_than_grpo(self):
+        """PPO should estimate ~2x memory of GRPO due to critic + ref models."""
+        common = dict(
+            gpus=4, tp_size=2, context_len=4096, batch_size=4,
+            ckpt="Qwen/Qwen3-0.6B", reward_fn_path="r.py",
+            gpu_probe=_fake_gpu(80.0, 70.0),
+        )
+        grpo_result = gen.generate_recipe(algo="grpo", **common)
+        ppo_result = gen.generate_recipe(algo="ppo", **common)
+        assert ppo_result.memory.total > grpo_result.memory.total
+        ratio = ppo_result.memory.total / grpo_result.memory.total
+        assert 1.8 < ratio < 2.5, f"PPO/GRPO ratio={ratio:.2f}, expected ~2x"
+
+    def test_ppo_multi_role_warning(self):
+        result = gen.generate_recipe(
+            algo="ppo", gpus=4, tp_size=2, context_len=4096, batch_size=4,
+            ckpt="Qwen/Qwen3-0.6B", reward_fn_path="r.py",
+            gpu_probe=_fake_gpu(80.0, 70.0),
+        )
+        assert any("Multi-role" in w and "critic" in w for w in result.warnings)
+
+    def test_estimate_memory_directly_with_extra_roles(self):
+        """Unit test for estimate_memory num_extra_trainable/frozen params."""
+        shape = gen.infer_shape_from_name("Qwen/Qwen3-0.6B")[0]
+        gpu = gen.GpuMemoryInfo(
+            total_bytes=int(80 * 1e9), free_bytes=int(70 * 1e9),
+            device_count=1, device_ids=[0],
+        )
+        base = gen.estimate_memory(
+            shape, tp_size=1, dp_size=1, max_running_seqs=4,
+            max_cache_len=4096, mini_bs=2, gpu_info=gpu,
+        )
+        with_extra = gen.estimate_memory(
+            shape, tp_size=1, dp_size=1, max_running_seqs=4,
+            max_cache_len=4096, mini_bs=2, gpu_info=gpu,
+            num_extra_trainable=1, num_extra_frozen=1,
+        )
+        assert with_extra.total > base.total
+        extra = with_extra.total - base.total
+        per_gpu_weights = gen.estimate_weight_bytes(shape)
+        per_gpu_opt = gen.estimate_optimizer_bytes(gen.estimate_param_count(shape), shape.dtype_bytes)
+        expected_extra = per_gpu_weights * 2 + per_gpu_opt
+        assert extra == expected_extra
+
+
+# == parameter validation =================================================
+
+
+class TestParameterValidation:
+    """Tests for new validation: n_samples, mini_bs, enum values."""
+
+    def test_n_samples_zero_raises_for_rl(self):
+        with pytest.raises(ValueError, match="n-samples must be >= 1"):
+            gen.generate_recipe(
+                algo="grpo", gpus=1, tp_size=1, context_len=4096, batch_size=2,
+                ckpt="Qwen/Qwen3-0.6B", reward_fn_path="r.py",
+                n_samples=0,
+            )
+
+    def test_mini_bs_exceeds_batch_size_warns_and_caps(self):
+        result = gen.generate_recipe(
+            algo="sft", gpus=1, tp_size=1, context_len=2048, batch_size=4,
+            ckpt="Qwen/Qwen3-0.6B", mini_bs=16,
+        )
+        assert any("mini-bs" in w and "capped" in w for w in result.warnings)
+        assert result.config["mini_bs"].value <= 4
+
+    def test_invalid_attn_backend_raises(self):
+        with pytest.raises(ValueError, match="attn_backend.*invalid"):
+            gen.generate_recipe(
+                algo="sft", gpus=1, tp_size=1, context_len=2048, batch_size=4,
+                ckpt="Qwen/Qwen3-0.6B",
+                overrides={"attn_backend": "bogus"},
+            )
+
+
+# == --lr CLI flag ========================================================
+
+
+class TestLearningRateFlag:
+    """Tests for the --lr CLI flag mapping to optimizer_lr."""
+
+    def test_lr_appears_in_command_and_explicit(self):
+        result = gen.generate_recipe(
+            algo="grpo", gpus=1, tp_size=1, context_len=4096, batch_size=2,
+            ckpt="Qwen/Qwen3-0.6B", reward_fn_path="r.py",
+            lr=5e-6,
+        )
+        assert "--lr 5e-06" in result.command
+        assert result.config["optimizer_lr"].value == 5e-6
+        assert result.config["optimizer_lr"].source == "explicit"
+
+    def test_lr_none_uses_default(self):
+        result = gen.generate_recipe(
+            algo="sft", gpus=1, tp_size=1, context_len=2048, batch_size=4,
+            ckpt="Qwen/Qwen3-0.6B",
+        )
+        assert result.config["optimizer_lr"].value == 1e-6
+        assert result.config["optimizer_lr"].source == "default"
+        assert "--lr" not in result.command
+
+
+# == auto_detect_params n_samples fix ======================================
+
+
+class TestAutoDetectNSamples:
+    """Tests that auto_detect_params uses the actual n_samples, not hardcoded 8."""
+
+    def test_auto_detect_uses_custom_n_samples(self):
+        """auto_detect_params should use provided n_samples for batch estimation."""
+        shape = gen.infer_shape_from_name("Qwen/Qwen3-0.6B")[0]
+        param_count = gen.estimate_param_count(shape)
+        gpu = gen.GpuMemoryInfo(
+            total_bytes=int(80 * 1e9), free_bytes=int(70 * 1e9),
+            device_count=8, device_ids=list(range(8)),
+        )
+        params_4 = gen.auto_detect_params(gpu, param_count, "grpo", n_samples=4)
+        params_8 = gen.auto_detect_params(gpu, param_count, "grpo", n_samples=8)
+        assert params_8.batch_size <= params_4.batch_size

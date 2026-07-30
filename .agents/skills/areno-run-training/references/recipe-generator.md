@@ -55,6 +55,11 @@ areno train --algo gspo --ckpt Qwen/Qwen3-0.6B ...
 | Checkpoint | `--ckpt` | string | none | Model path or name for memory estimation |
 | Dataset | `--dataset-path` | string | none | Dataset path for row counting |
 | Reward function | `--reward-fn-path` | string | none | Python file defining reward_fn(record) |
+| Agent function | `--agent-fn` | string | none | Python file defining async run_agent(ctx, batch) for agentic RL |
+| Dataset loader | `--dataset-loader-fn` | string | none | Python file defining load_training_dataset() for custom dataset formats |
+| Agent timeout | `--agent-timeout-s` | float | 300.0 | Timeout in seconds for each agent rollout (agentic RL only) |
+| Train tool results | `--train-tool-results` | flag | off | Include tool result tokens in loss (agentic RL only) |
+| Learning rate | `--lr` | float | 1e-6 | Learning rate, maps to `optimizer_lr` |
 | Rollout samples | `--n-samples` | int | 4 | Samples per prompt (RL only) |
 | Microbatch | `--mini-bs` | int | min(batch_size,16) | Training microbatch size; uses 16 as upper bound unless explicitly set |
 | 8-bit Adam | `--adam-8bit` | flag | off | Use 8-bit Adam optimizer states |
@@ -105,7 +110,7 @@ A copyable `areno train ...` command followed by memory estimates and provenance
 **Config source values:**
 - `default` — value from the embedded default table (synced from `TrainerConfig`)
 - `derived` — computed from `--gpus`, `--context-len`, or `--batch-size`
-- `explicit` — set via `--set key=value`
+- `explicit` — set via a dedicated CLI flag (`--lr`, `--agent-fn`, etc.) or `--set key=value`
 
 ## Context-Length Splitting
 
@@ -145,6 +150,19 @@ When the model name contains a parameter count but does not match any known mode
 ### GPU VRAM Probing
 
 Probes free VRAM via `torch.cuda.mem_get_info` when available. When no GPU is detected, `headroom_bytes` is `null` and a warning is emitted. CPU tests inject `FakeGpuProbe` with deterministic values.
+
+### Multi-Role Memory Estimation
+
+For algorithms with multiple model roles, the generator adds extra memory to the estimate:
+
+| Algorithm | Extra trainable models | Extra frozen models | Memory impact |
+|-----------|----------------------|-------------------|---------------|
+| SFT | 0 | 0 | Baseline (policy only) |
+| DPO | 0 | 1 (ref) | +1x weights |
+| GSPO / GRPO | 0 | 0 | Baseline (policy only) |
+| PPO | 1 (critic) | 1 (ref) [+1 if `reward_ckpt`] | ~2x baseline |
+
+Frozen models contribute weights only (no optimizer). Trainable models contribute both weights and optimizer state. The estimate uses the peak of rollout vs train phases, following the same alternation model as single-role algorithms.
 
 ## Limitations
 
@@ -196,6 +214,20 @@ python .agents/skills/areno-run-training/scripts/generate_recipe.py \
     --reward-fn-path examples/math/math_verify_reward.py
 ```
 
+### Agentic RL Recipe
+
+```bash
+python .agents/skills/areno-run-training/scripts/generate_recipe.py \
+    --algo grpo --gpus 1 --tp-size 1 \
+    --context-len 4096 --batch-size 2 \
+    --ckpt Qwen/Qwen3-0.6B \
+    --reward-fn-path examples/agentic/sudoku/reward.py \
+    --agent-fn examples/agentic/sudoku/run_agent.py \
+    --dataset-loader-fn examples/agentic/sudoku/dataset_loader.py \
+    --agent-timeout-s 600 \
+    --lr 5e-6
+```
+
 ## Runtime Requirement Warnings
 
 The generator checks algorithm-specific required parameters and warns when missing (generation is not interrupted). These warnings indicate parameters needed at training runtime:
@@ -207,18 +239,35 @@ The generator checks algorithm-specific required parameters and warns when missi
 | PPO | `--critic-ckpt` |
 | DPO | `--ref-ckpt` |
 
+When `--agent-fn` is provided, the generator also warns if `--agent-timeout-s` is less than 60 seconds (too short for multi-turn rollouts).
+
+## Parameter Validation
+
+The generator validates the following and raises errors on invalid input:
+
+| Check | Behavior |
+|-------|----------|
+| `--n-samples >= 1` (RL only) | Raises `ValueError` |
+| `--mini-bs > --batch-size` | Warns and caps `mini_bs` to `batch_size` |
+| `attn_backend` enum | Must be `flash` or `native` |
+| `model_hub` enum | Must be `hf` or `modelscope` |
+| `lr_decay_style` enum | Must be `cosine`, `linear`, or `constant` |
+| `--gpus` divisible by `--tp-size` | Raises `ValueError` |
+
 ## CLI Option Name Mapping
 
 Some CLI flags map to non-obvious config field names:
 
 | CLI flag | Config field | Notes |
 |----------|-------------|-------|
-| `--lr` | `optimizer_lr` | Direct rename |
-| `--min-lr` | `optimizer_min_lr` | Direct rename |
-| `--adam-beta1` | `optimizer_beta1` | Direct rename |
-| `--adam-beta2` | `optimizer_beta2` | Direct rename |
-| `--disable-thinking` | `chat_template_enable_thinking` | Ternary: no flag → None, flag → False |
-| `--drop-rollout-state` | `keep_rollout_state` | Inverted boolean |
+| `--lr` | `optimizer_lr` | Dedicated flag; `--set lr=value` takes precedence |
+| `--min-lr` | `optimizer_min_lr` | Use via `--set` |
+| `--adam-beta1` | `optimizer_beta1` | Use via `--set` |
+| `--adam-beta2` | `optimizer_beta2` | Use via `--set` |
+| `--disable-thinking` | `chat_template_enable_thinking` | Ternary: no flag → None, flag → False; use via `--set` |
+| `--drop-rollout-state` | `keep_rollout_state` | Inverted boolean; use via `--set` |
+
+Dedicated flags (`--lr`, `--agent-fn`, `--dataset-loader-fn`, `--agent-timeout-s`, `--train-tool-results`) produce `explicit` provenance and appear in the generated command. The `--set` mechanism is the most explicit override and takes precedence over dedicated flags.
 
 CLI-only utility flags (`--tune-params`, `--mem-frac`, `--smoke-infer`, `--smoke-train`, `--tune-max-samples`) cannot be used with `--set`.
 

@@ -536,10 +536,18 @@ def estimate_memory(
     max_cache_len: int, mini_bs: int, adam_8bit: bool = False,
     activation_checkpointing: bool = True, gpu_info: "GpuMemoryInfo | None" = None,
     block_size: int = DEFAULT_KV_BLOCK_SIZE,
+    num_extra_trainable: int = 0, num_extra_frozen: int = 0,
 ) -> MemoryBreakdown:
     param_count = estimate_param_count(shape)
     per_gpu_weights = estimate_weight_bytes(shape) // tp_size
     per_gpu_opt = estimate_optimizer_bytes(param_count, shape.dtype_bytes, adam_8bit=adam_8bit) // tp_size
+
+    # Extra trainable models (e.g. PPO critic): weights + optimizer per model.
+    extra_trainable_weights = per_gpu_weights * num_extra_trainable
+    extra_trainable_opt = per_gpu_opt * num_extra_trainable
+
+    # Extra frozen models (e.g. PPO/DPO ref model): weights only, no optimizer.
+    extra_frozen_weights = per_gpu_weights * num_extra_frozen
 
     # KV cache: prompts are split across DP ranks, so each GPU only holds
     # max_running_seqs / dp_size concurrent sequences (not the full batch).
@@ -559,8 +567,20 @@ def estimate_memory(
     # model offloads train weights but holds KV cache. During train, KV cache
     # is released and train weights + optimizer + activations are loaded.
     # Peak memory is therefore the LARGER of the two phases, not their sum.
-    rollout_phase = per_gpu_kv + per_gpu_weights  # KV + infer weights (no opt/act)
-    train_phase = per_gpu_weights + per_gpu_opt + per_gpu_act  # no KV
+    #
+    # Multi-role algorithms (PPO, DPO) add extra model weights:
+    # - PPO: critic (trainable) + ref (frozen) [+ reward (frozen)]
+    # - DPO: ref (frozen)
+    # Frozen models are present in both phases; trainable extras have
+    # optimizer state in train phase and infer weights in rollout phase.
+    all_weights = per_gpu_weights + extra_trainable_weights + extra_frozen_weights
+    rollout_phase = per_gpu_kv + all_weights
+    train_phase = (
+        per_gpu_weights + extra_trainable_weights  # trainable weights
+        + per_gpu_opt + extra_trainable_opt        # optimizer for trainable models
+        + extra_frozen_weights                      # frozen models stay loaded
+        + per_gpu_act
+    )
     total = max(rollout_phase, train_phase)
 
     per_gpu_total = gpu_info.total_bytes if gpu_info else 0
@@ -615,6 +635,7 @@ def auto_detect_params(
     algo: str,
     *,
     mem_frac: float = 0.85,
+    n_samples: int = 4,
 ) -> AutoParams:
     """Derive GPU count, tp_size, context_len, and batch_size from hardware.
 
@@ -673,8 +694,8 @@ def auto_detect_params(
 
     # For RL, each prompt generates n_samples sequences, so batch contributes
     # batch_size * n_samples to KV cache.
-    n_samples = 8 if algo in RL_ALGOS else 1
-    per_batch_unit = n_samples * (kv_per_seq + act_per_seq)
+    n_samples_eff = n_samples if algo in RL_ALGOS else 1
+    per_batch_unit = n_samples_eff * (kv_per_seq + act_per_seq)
 
     if per_batch_unit <= 0:
         batch = 1
@@ -851,6 +872,9 @@ def generate_recipe(
     block_size: int = DEFAULT_KV_BLOCK_SIZE,
     model_shape: "ModelShape | None" = None,
     auto: bool = False,
+    agent_fn: "str | None" = None, dataset_loader_fn: "str | None" = None,
+    agent_timeout_s: "float | None" = None, train_tool_results: bool = False,
+    lr: "float | None" = None,
 ) -> RecipeResult:
     """Generate a complete training recipe.
 
@@ -900,7 +924,7 @@ def generate_recipe(
                 param_count = 1_000_000_000
                 warnings.append("--auto: could not determine model size; assuming 1B params for sizing.")
 
-            auto_params = auto_detect_params(gpu_info, param_count, algo, mem_frac=mem_frac)
+            auto_params = auto_detect_params(gpu_info, param_count, algo, mem_frac=mem_frac, n_samples=n_samples)
             warnings.append(auto_params.note)
             # If user specified --gpus, honor it; otherwise use detected count.
             gpus = gpus or auto_params.gpus
@@ -931,6 +955,11 @@ def generate_recipe(
         raise ValueError("[stage=sizing] --context-len must be positive")
     if batch_size <= 0:
         raise ValueError("[stage=sizing] --batch-size must be positive")
+    if algo in RL_ALGOS and n_samples < 1:
+        raise ValueError("[stage=sizing] --n-samples must be >= 1 for RL algorithms")
+    if mini_bs is not None and mini_bs > batch_size:
+        warnings.append(f"--mini-bs ({mini_bs}) > --batch-size ({batch_size}); will be capped at batch_size.")
+        mini_bs = min(mini_bs, batch_size)
 
     # 4. validate overrides against real option names
     valid_options = _valid_option_names()
@@ -946,6 +975,19 @@ def generate_recipe(
             overrides_field["chat_template_enable_thinking"] = not val if val else None
         else:
             overrides_field[_CLI_TO_FIELD.get(key, key)] = val
+
+    # 4b. validate enum-valued overrides
+    _ENUM_VALIDATORS: dict[str, set[str]] = {
+        "attn_backend": {"flash", "native"},
+        "model_hub": {"hf", "modelscope"},
+        "lr_decay_style": {"cosine", "linear", "constant"},
+    }
+    for field_name, valid_values in _ENUM_VALIDATORS.items():
+        val = overrides_field.get(field_name)
+        if val is not None and val not in valid_values:
+            raise ValueError(
+                f"[stage=override] {field_name}='{val}' is invalid; must be one of: {', '.join(sorted(valid_values))}"
+            )
 
     # 5. split context_len
     max_prompt_tokens, max_new_tokens = split_context_len(algo, context_len)
@@ -1009,11 +1051,33 @@ def generate_recipe(
 
     if shape is not None:
         max_cache_len = max_prompt_tokens + max_new_tokens
+        # Compute extra model roles for multi-role algorithms.
+        # PPO: critic (trainable) + ref (frozen) [+ reward (frozen) if reward_ckpt]
+        # DPO: ref (frozen)
+        num_extra_trainable = 1 if algo == "ppo" else 0
+        num_extra_frozen = 0
+        if algo == "ppo":
+            num_extra_frozen = 1  # ref model
+            if overrides_field.get("reward_ckpt"):
+                num_extra_frozen += 1  # reward model
+        elif algo == "dpo":
+            num_extra_frozen = 1  # ref model
+        if num_extra_trainable or num_extra_frozen:
+            role_desc = []
+            if num_extra_trainable:
+                role_desc.append(f"{num_extra_trainable} trainable (critic)")
+            if num_extra_frozen:
+                role_desc.append(f"{num_extra_frozen} frozen (ref/reward)")
+            warnings.append(
+                f"Multi-role algo '{algo}': extra memory for {', '.join(role_desc)} included in estimate."
+            )
+
         memory = estimate_memory(
             shape, tp_size=tp_size, dp_size=dp_size, max_running_seqs=max_running_seqs,
             max_cache_len=max_cache_len, mini_bs=resolved_mini_bs, adam_8bit=adam_8bit,
             activation_checkpointing=activation_checkpointing, gpu_info=gpu_info,
             block_size=block_size,
+            num_extra_trainable=num_extra_trainable, num_extra_frozen=num_extra_frozen,
         )
 
         # Auto-adjust batch_size to fit within free VRAM.
@@ -1050,6 +1114,7 @@ def generate_recipe(
                         mini_bs=cand_mini, adam_8bit=adam_8bit,
                         activation_checkpointing=activation_checkpointing,
                         gpu_info=gpu_info, block_size=block_size,
+                        num_extra_trainable=num_extra_trainable, num_extra_frozen=num_extra_frozen,
                     )
                     if cand_mem.total <= effective_free:
                         best_batch = candidate
@@ -1065,6 +1130,7 @@ def generate_recipe(
                         mini_bs=1, adam_8bit=adam_8bit,
                         activation_checkpointing=activation_checkpointing,
                         gpu_info=gpu_info, block_size=block_size,
+                        num_extra_trainable=num_extra_trainable, num_extra_frozen=num_extra_frozen,
                     )
 
                 if best_batch < original_batch:
@@ -1097,7 +1163,7 @@ def generate_recipe(
             warnings.append(f"Could not count dataset rows for '{dataset_path}' (unsupported format or remote ref).")
 
     # 9. algorithm-specific requirement checks
-    if algo == "sft" and not overrides_field.get("dataset_loader_fn"):
+    if algo == "sft" and not dataset_loader_fn and not overrides_field.get("dataset_loader_fn"):
         warnings.append("--algo sft requires --dataset-loader-fn at run time.")
     if algo in RL_ALGOS and not reward_fn_path and not overrides_field.get("reward_ckpt"):
         warnings.append(f"--algo {algo} requires --reward-fn-path or --reward-ckpt at run time.")
@@ -1105,6 +1171,9 @@ def generate_recipe(
         warnings.append("--algo ppo requires --critic-ckpt at run time.")
     if algo == "dpo" and not overrides_field.get("ref_ckpt"):
         warnings.append("--algo dpo requires --ref-ckpt at run time (or it defaults to actor ckpt).")
+    if agent_fn:
+        if agent_timeout_s is not None and agent_timeout_s < 60:
+            warnings.append(f"--agent-timeout-s={agent_timeout_s} is very short for multi-turn agent rollouts.")
 
     # 10. build config dict (standalone, no areno dependency)
     config_values: dict[str, Any] = dict(_field_defaults_for_algo(algo))
@@ -1128,11 +1197,32 @@ def generate_recipe(
     if algo == "dpo":
         config_values["dpo_beta"] = 0.1
 
+    # Agentic RL parameters
+    derived_agentic: list[str] = []
+    if agent_fn:
+        config_values["agent_fn"] = agent_fn
+        derived_agentic.append("agent_fn")
+    if dataset_loader_fn:
+        config_values["dataset_loader_fn"] = dataset_loader_fn
+        derived_agentic.append("dataset_loader_fn")
+    if agent_timeout_s is not None:
+        config_values["agent_timeout_s"] = agent_timeout_s
+        derived_agentic.append("agent_timeout_s")
+    if train_tool_results:
+        config_values["train_tool_results"] = True
+        derived_agentic.append("train_tool_results")
+    if lr is not None:
+        config_values["optimizer_lr"] = lr
+        derived_agentic.append("optimizer_lr")
+
     explicit: dict[str, Any] = {}
     for key, val in overrides_field.items():
         if _is_valid_field(algo, key):
             config_values[key] = val
             explicit[key] = val
+    # Agentic parameters passed via dedicated CLI flags are also explicit.
+    for key in derived_agentic:
+        explicit[key] = config_values[key]
 
     # Optional: validate with real areno dataclass when available
     if _try_areno_available():
@@ -1192,8 +1282,13 @@ def main(argv: "Optional[List[str]]" = None) -> int:
                         help="Auto-detect GPUs and derive tp_size/context_len/batch_size from hardware.")
     parser.add_argument("--dataset-path", default=None, help="Dataset path for row counting.")
     parser.add_argument("--reward-fn-path", default=None, help="Python file defining reward_fn(record).")
+    parser.add_argument("--agent-fn", default=None, help="Python file defining async run_agent(ctx, batch) for agentic RL.")
+    parser.add_argument("--dataset-loader-fn", default=None, help="Python file defining load_training_dataset() for custom dataset formats.")
+    parser.add_argument("--agent-timeout-s", type=float, default=None, help="Timeout in seconds for each agent rollout.")
+    parser.add_argument("--train-tool-results", action="store_true", help="Include tool result tokens in loss (agentic RL only).")
     parser.add_argument("--n-samples", type=int, default=4, help="Rollout samples per prompt (RL only).")
     parser.add_argument("--mini-bs", type=int, default=None, help="Training microbatch size.")
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate (maps to optimizer_lr).")
     parser.add_argument("--mem-frac", type=float, default=0.9, help="Target GPU memory fraction (advisory).")
     parser.add_argument("--adam-8bit", action="store_true", help="Use 8-bit Adam optimizer states.")
     parser.add_argument("--no-activation-checkpointing", action="store_true", help="Disable activation checkpointing.")
@@ -1217,6 +1312,9 @@ def main(argv: "Optional[List[str]]" = None) -> int:
             mem_frac=args.mem_frac, adam_8bit=args.adam_8bit,
             activation_checkpointing=not args.no_activation_checkpointing,
             block_size=args.block_size, auto=args.auto,
+            agent_fn=args.agent_fn, dataset_loader_fn=args.dataset_loader_fn,
+            agent_timeout_s=args.agent_timeout_s, train_tool_results=args.train_tool_results,
+            lr=args.lr,
         )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
