@@ -56,13 +56,14 @@ class TestSFTRecipe:
         assert "--world-size 8" in result.command
         assert "--tp-size 4" in result.command
         assert "--batch-size 16" in result.command
-        assert "--max-prompt-tokens 2048" in result.command
-        assert "--max-new-tokens 0" in result.command  # SFT: all context, no gen
+        assert "--max-prompt-tokens 2047" in result.command
+        assert "--max-new-tokens 1" in result.command  # SFT: min 1 (CLI requires > 0)
+        assert "--dataset-loader-fn" in result.command  # SFT requires it (CLI line 192-193)
 
     def test_context_len_split_all_prompt(self):
         prompt, new = gen.split_context_len("sft", 2048)
-        assert prompt == 2048
-        assert new == 0
+        assert prompt == 2047  # context_len - 1 (reserved for min new_tokens)
+        assert new == 1        # CLI requires max_new_tokens > 0
 
     def test_provenance_sources(self):
         result = gen.generate_recipe(
@@ -82,6 +83,7 @@ class TestSFTRecipe:
         )
         assert result.config["ckpt"].value == "<your-ckpt>"
         assert result.config["dataset_path"].value == "<your-dataset>"
+        assert result.config["dataset_loader_fn"].value == "<your-dataset-loader>"
 
 
 class TestDPORecipe:
@@ -185,7 +187,8 @@ class TestInvalidInputs:
         result = gen.generate_recipe(
             algo="sft", gpus=4, tp_size=2, context_len=0, batch_size=8
         )
-        assert result.config["max_prompt_tokens"].value == 2048
+        # SFT split: max_prompt_tokens = context_len - 1 = 2047
+        assert result.config["max_prompt_tokens"].value == 2047
 
     def test_negative_context_len(self):
         # context_len is negative, not caught by default guard, split will raise.
@@ -814,3 +817,149 @@ class TestAutoDetectNSamples:
         params_4 = gen.auto_detect_params(gpu, param_count, "grpo", n_samples=4)
         params_8 = gen.auto_detect_params(gpu, param_count, "grpo", n_samples=8)
         assert params_8.batch_size <= params_4.batch_size
+
+
+# == CLI integration: generated command must pass areno train validation =====
+
+
+class TestGeneratedCommandCLICompatibility:
+    """Verify that generated commands satisfy areno CLI constraints (train.py).
+
+    These tests parse the command string and check known CLI validation rules
+    that would cause ``click.UsageError`` at runtime.  They do NOT import or run
+    the actual ``areno`` CLI — only the constraints documented in
+    ``areno/cli/train.py`` lines 190-241 are checked statically.
+    """
+
+    @staticmethod
+    def _parse_command(cmd: str) -> dict[str, str]:
+        """Parse an 'areno train --flag value ...' string into a dict."""
+        tokens = cmd.split()
+        assert tokens[0] == "areno" and tokens[1] == "train"
+        result: dict[str, str] = {}
+        i = 2
+        while i < len(tokens):
+            if tokens[i].startswith("--"):
+                key = tokens[i][2:]
+                if i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
+                    result[key] = tokens[i + 1]
+                    i += 2
+                else:
+                    result[key] = "True"  # boolean flag
+                    i += 1
+            else:
+                i += 1
+        return result
+
+    def test_sft_command_passes_cli_constraints(self):
+        """SFT: max_new_tokens > 0, dataset_loader_fn present (train.py:192-193, 238-239)."""
+        result = gen.generate_recipe(
+            algo="sft", gpus=8, tp_size=4, context_len=2048, batch_size=16,
+        )
+        parsed = self._parse_command(result.command)
+        # train.py:238-239 — max_new_tokens must be positive
+        assert int(parsed["max-new-tokens"]) > 0, \
+            f"SFT max_new_tokens={parsed['max-new-tokens']} would fail CLI validation"
+        # train.py:236-237 — max_prompt_tokens must be positive
+        assert int(parsed["max-prompt-tokens"]) > 0
+        # train.py:192-193 — dataset_loader_fn required for SFT
+        assert "dataset-loader-fn" in parsed, \
+            "SFT command missing --dataset-loader-fn (train.py line 192-193 requires it)"
+
+    def test_dpo_command_passes_cli_constraints(self):
+        """DPO: max_new_tokens > 0, max_prompt_tokens > 0."""
+        result = gen.generate_recipe(
+            algo="dpo", gpus=4, tp_size=2, context_len=4096, batch_size=8,
+        )
+        parsed = self._parse_command(result.command)
+        assert int(parsed["max-new-tokens"]) > 0
+        assert int(parsed["max-prompt-tokens"]) > 0
+        assert parsed["algo"] == "dpo"
+
+    def test_gspo_command_passes_cli_constraints(self):
+        """GSPO: max_new_tokens > 0, reward_fn_path present."""
+        result = gen.generate_recipe(
+            algo="gspo", gpus=8, tp_size=4, context_len=4096, batch_size=32,
+            reward_fn_path="examples/math/math_verify_reward.py",
+        )
+        parsed = self._parse_command(result.command)
+        assert int(parsed["max-new-tokens"]) > 0
+        assert int(parsed["max-prompt-tokens"]) > 0
+        assert "reward-fn-path" in parsed
+
+    def test_grpo_command_passes_cli_constraints(self):
+        """GRPO: max_new_tokens > 0, n_samples present."""
+        result = gen.generate_recipe(
+            algo="grpo", gpus=4, tp_size=2, context_len=2048, batch_size=4,
+            reward_fn_path="r.py", n_samples=8,
+        )
+        parsed = self._parse_command(result.command)
+        assert int(parsed["max-new-tokens"]) > 0
+        assert int(parsed["n-samples"]) >= 1
+
+    def test_ppo_command_passes_cli_constraints(self):
+        """PPO: max_new_tokens > 0, reward_fn_path present."""
+        result = gen.generate_recipe(
+            algo="ppo", gpus=4, tp_size=2, context_len=4096, batch_size=4,
+            reward_fn_path="r.py",
+        )
+        parsed = self._parse_command(result.command)
+        assert int(parsed["max-new-tokens"]) > 0
+        assert "reward-fn-path" in parsed
+
+    def test_all_algos_no_zero_new_tokens(self):
+        """No algorithm should produce max_new_tokens=0 (train.py:238-239)."""
+        for algo in ["sft", "dpo", "gspo", "grpo", "ppo"]:
+            kwargs = dict(gpus=4, tp_size=2, context_len=2048, batch_size=4)
+            if algo in {"gspo", "grpo", "ppo"}:
+                kwargs["reward_fn_path"] = "r.py"
+            result = gen.generate_recipe(algo=algo, **kwargs)
+            parsed = self._parse_command(result.command)
+            assert int(parsed["max-new-tokens"]) > 0, \
+                f"algo={algo}: max_new_tokens=0 would fail CLI validation"
+
+    def test_all_algos_no_zero_prompt_tokens(self):
+        """No algorithm should produce max_prompt_tokens=0 (train.py:236-237)."""
+        for algo in ["sft", "dpo", "gspo", "grpo", "ppo"]:
+            kwargs = dict(gpus=4, tp_size=2, context_len=512, batch_size=4)
+            if algo in {"gspo", "grpo", "ppo"}:
+                kwargs["reward_fn_path"] = "r.py"
+            result = gen.generate_recipe(algo=algo, **kwargs)
+            parsed = self._parse_command(result.command)
+            assert int(parsed["max-prompt-tokens"]) > 0, \
+                f"algo={algo}: max_prompt_tokens=0 would fail CLI validation"
+
+    def test_sft_with_explicit_loader_fn(self):
+        """SFT with --dataset-loader-fn provided should include it in command."""
+        result = gen.generate_recipe(
+            algo="sft", gpus=8, tp_size=4, context_len=2048, batch_size=16,
+            dataset_loader_fn="examples/math/dataset_loader.py",
+        )
+        assert "--dataset-loader-fn examples/math/dataset_loader.py" in result.command
+        assert result.config["dataset_loader_fn"].source == "explicit"
+
+    def test_cli_invocation_sft_has_dataset_loader_fn(self):
+        """CLI-generated SFT command includes --dataset-loader-fn."""
+        proc = gen_subprocess = None
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "--algo", "sft", "--gpus", "8", "--tp-size", "4",
+             "--context-len", "2048", "--batch-size", "16",
+             "--format", "cli"],
+            cwd=ROOT, capture_output=True, text=True, timeout=30, check=False,
+        )
+        assert proc.returncode == 0
+        assert "--dataset-loader-fn" in proc.stdout
+
+    def test_cli_invocation_sft_no_zero_new_tokens(self):
+        """CLI-generated SFT command does not contain --max-new-tokens 0."""
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "--algo", "sft", "--gpus", "8", "--tp-size", "4",
+             "--context-len", "2048", "--batch-size", "16",
+             "--format", "cli"],
+            cwd=ROOT, capture_output=True, text=True, timeout=30, check=False,
+        )
+        assert proc.returncode == 0
+        assert "--max-new-tokens 0" not in proc.stdout
+        assert "--max-new-tokens 1" in proc.stdout

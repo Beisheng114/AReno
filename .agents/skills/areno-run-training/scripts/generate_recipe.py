@@ -596,11 +596,18 @@ def estimate_memory(
 # == context-length splitting ================================================
 
 def split_context_len(algo: str, context_len: int) -> "tuple[int, int]":
+    """Split *context_len* into (max_prompt_tokens, max_new_tokens).
+
+    The areno CLI requires ``max_new_tokens > 0`` (see ``train.py`` line 238),
+    so SFT — which does not generate tokens — is given a minimum of 1.
+    """
     if context_len <= 0:
         raise ValueError("context_len must be positive")
     if algo in OFFLINE_ALGOS:
         if algo == "sft":
-            return context_len, 0
+            # SFT has no generation, but CLI requires max_new_tokens > 0.
+            # Reserve 1 token so the command passes CLI validation.
+            return max(context_len - 1, 1), 1
         half = context_len // 2
         return half, context_len - half
     prompt = min(1024, context_len // 4)
@@ -769,6 +776,9 @@ _BASE_REQUIRED: frozenset[str] = frozenset({
     "ckpt", "dataset_path", "tp_size", "world_size",
     "batch_size", "mini_bs", "max_prompt_tokens", "max_new_tokens",
 })
+_SFT_REQUIRED: frozenset[str] = _BASE_REQUIRED | frozenset({
+    "dataset_loader_fn",
+})
 _RL_REQUIRED: frozenset[str] = _BASE_REQUIRED | frozenset({
     "n_samples", "reward_fn_path", "max_running_prompts",
 })
@@ -782,6 +792,8 @@ def _required_fields_for(algo: str) -> frozenset[str]:
         return _RL_REQUIRED
     if algo == "dpo":
         return _DPO_REQUIRED
+    if algo == "sft":
+        return _SFT_REQUIRED
     return _BASE_REQUIRED
 
 
@@ -1009,6 +1021,8 @@ def generate_recipe(
         derived["keep_rollout_state"] = "recipe input"
     else:
         max_running_seqs = batch_size
+    if algo == "sft":
+        derived["dataset_loader_fn"] = "required for sft"
     if algo == "dpo":
         derived["dpo_beta"] = "recipe input"
 
@@ -1190,6 +1204,11 @@ def generate_recipe(
         adam_8bit=adam_8bit,
         activation_checkpointing=activation_checkpointing,
     )
+    # SFT requires --dataset-loader-fn at the CLI level (train.py line 192-193).
+    # Use a placeholder so the generated command includes it and is runnable
+    # after the user substitutes a real path.
+    if algo == "sft":
+        config_values["dataset_loader_fn"] = dataset_loader_fn or "<your-dataset-loader>"
     if algo in RL_ALGOS:
         config_values["n_samples"] = n_samples
         config_values["reward_fn_path"] = reward_fn_path
