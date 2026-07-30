@@ -142,6 +142,10 @@ def collect_train_batch_stats(train_batch) -> dict:
         prefix_len = sum(1 for is_prompt in prompt_mask if is_prompt)
         response_len = len(response_logprobs)
         stats["rewards"].append(seq.reward)
+        # `transformed_reward` is only set when reward transformation is on, so
+        # the list stays empty for historic runs and adds no new scalars.
+        if seq.transformed_reward is not None:
+            stats["transformed_rewards"].append(seq.transformed_reward)
         stats["advantages"].extend(response_advantages)
         record_rollout_sequence_stats(
             stats,
@@ -157,6 +161,7 @@ def init_rollout_stats(skipped_long: int = 0, total_skipped_long: int = 0) -> di
 
     return {
         "rewards": [],
+        "transformed_rewards": [],
         "logprobs": [],
         "advantages": [],
         "seq_len": [],
@@ -188,6 +193,7 @@ def record_training_stats(writer, stats, step, train_res, train_batch, timings: 
     rewards = np.asarray(stats.get("rewards", []), dtype=np.float32)
     advantages = np.asarray(stats.get("advantages", []), dtype=np.float32)
     logprobs = np.asarray(stats.get("logprobs", []), dtype=np.float32)
+    transformed_rewards = np.asarray(stats.get("transformed_rewards", []), dtype=np.float32)
 
     if rewards.size:
         writer.add_scalar("rollout/rewards_mean", rewards.mean(), step)
@@ -197,6 +203,14 @@ def record_training_stats(writer, stats, step, train_res, train_batch, timings: 
         # Binary verifier rewards conventionally use {0,1}; recording the
         # fraction of strictly-positive rewards approximates pass-rate.
         writer.add_scalar("rollout/accuracy", (rewards > 0).mean(), step)
+    # Raw and transformed reward distributions are recorded under separate
+    # tags so operators can compare the unshaped reward signal against the
+    # distribution actually fed into advantage computation.
+    if transformed_rewards.size:
+        writer.add_scalar("rollout/transformed_reward_mean", transformed_rewards.mean(), step)
+        writer.add_scalar("rollout/transformed_reward_std", transformed_rewards.std(), step)
+        writer.add_scalar("rollout/transformed_reward_max", transformed_rewards.max(), step)
+        writer.add_scalar("rollout/transformed_reward_min", transformed_rewards.min(), step)
     if advantages.size:
         writer.add_scalar("rollout/advantages_mean", advantages.mean(), step)
         writer.add_scalar("rollout/advantages_std", advantages.std(), step)

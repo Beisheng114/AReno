@@ -20,6 +20,9 @@ algorithms, ``areno.api.trainers.policy_only.PolicyOnlyTrainer`` emits:
 * ``role=policy stage=rollout_start`` and ``stage=rollout_end`` around
   sampling or agentic execution.
 * ``metric=reward_mean`` after rewards are computed.
+* ``stage=reward_transform`` with ``mode=``, raw and transformed distribution
+  summaries (``count``/``mean``/``std``/``min``/``max``) when a non-disabled
+  reward transform is active (see ``--reward-transform-mode``).
 * ``metric=rollout_logprob_mean`` when rollout logprobs are available.
 * ``role=policy stage=train_start`` and ``stage=train_end`` around the
   optimizer step.
@@ -133,6 +136,13 @@ The writer lives in ``areno.api.metrics``. It records three namespaces:
    ``rollout/seq_len_mean``, ``rollout/prompt_len_mean``,
    ``rollout/response_len_mean``, ``rollout/num_sequences``,
    ``rollout/skipped_long``, and ``rollout/total_skipped_long``.
+   When reward transformation is enabled (``--reward-transform-mode`` clip or
+   standardize), the transformed reward distribution is recorded under separate
+   tags: ``rollout/transformed_reward_mean``,
+   ``rollout/transformed_reward_std``,
+   ``rollout/transformed_reward_max``, and
+   ``rollout/transformed_reward_min``. These tags are absent in disabled mode
+   so historic TensorBoard layouts are unchanged.
 
 ``train/*``
    Every scalar returned in ``train_stats``. Typical examples are

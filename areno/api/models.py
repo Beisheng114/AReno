@@ -82,4 +82,9 @@ class TrainSequence(BaseModel):
     values: list[float] = Field(default_factory=list)
     ref_logprobs: list[float] = Field(default_factory=list)
     reward: float = Field(default=0.0)
+    # Raw reward that a downstream transform (clip/standardize) was applied to.
+    # Populated only when reward transformation is enabled so the metrics
+    # recorder can keep raw and transformed reward distributions separate; left
+    # ``None`` otherwise to preserve the historic metrics layout exactly.
+    transformed_reward: float | None = Field(default=None)
     eos_token_id: int = Field(default=0)

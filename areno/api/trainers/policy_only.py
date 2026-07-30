@@ -176,6 +176,49 @@ class PolicyOnlyTrainer:
     def _agentic_enabled(self) -> bool:
         return bool(getattr(self.config, "agent_fn", None))
 
+    def _transform_batch_rewards(self, rewards_all: list[float]) -> tuple[list[float], dict, bool]:
+        """Apply the configured reward transform to a flat batch of rewards.
+
+        Returns the transformed rewards (fed into advantage computation), a
+        ``summary`` dict that keeps raw and transformed distributions separate,
+        and whether a non-disabled transform was applied. In ``disabled`` mode
+        the output is identical to the input, so the GRPO/GSPO advantage path
+        is numerically unchanged.
+        """
+
+        from areno.api.reward_transform import RewardTransformConfig, transform_rewards
+
+        config = getattr(self.config, "reward_transform_config", None)
+        if config is None or not callable(config):
+            config = RewardTransformConfig()
+        else:
+            config = config()
+        transformed, summary = transform_rewards(rewards_all, config)
+        if config.enabled and summary["raw"]["count"]:
+            epoch = getattr(self, "_dashboard_epoch", None)
+            step = getattr(self, "_dashboard_step", None)
+            raw = summary["raw"]
+            tr = summary["transformed"]
+            self.logger.info(
+                "epoch=%s step=%s stage=reward_transform mode=%s "
+                "raw[count=%d mean=%.6f std=%.6f min=%.6f max=%.6f] "
+                "transformed[count=%d mean=%.6f std=%.6f min=%.6f max=%.6f]",
+                epoch,
+                step,
+                config.mode,
+                raw["count"],
+                raw["mean"],
+                raw["std"],
+                raw["min"],
+                raw["max"],
+                tr["count"],
+                tr["mean"],
+                tr["std"],
+                tr["min"],
+                tr["max"],
+            )
+        return transformed, summary, config.enabled
+
     def _loss_mask_policy(self):
         from areno.api.agentic import LossMaskPolicy
 
@@ -406,6 +449,10 @@ class PolicyOnlyTrainer:
             raise ValueError("agentic policy training requires a reward_fn")
         train_batch = []
         rewards_all = [float(reward) for reward in agent_batch.rewards]
+        # Reward shaping (clip/standardize) runs on the whole batch before
+        # group-relative advantage computation; raw rewards are still returned
+        # and logged so historic observability is unchanged.
+        transformed_rewards, _, reward_transform_enabled = self._transform_batch_rewards(rewards_all)
         rollout_logprobs = []
         grouped: dict[int, list[int]] = {}
         for row_idx, record in enumerate(agent_batch.reward_records):
@@ -413,7 +460,7 @@ class PolicyOnlyTrainer:
             grouped.setdefault(prompt_index, []).append(row_idx)
         advantages_by_row: dict[int, float] = {}
         for row_indices in grouped.values():
-            group_rewards = [rewards_all[row_idx] for row_idx in row_indices]
+            group_rewards = [transformed_rewards[row_idx] for row_idx in row_indices]
             for row_idx, advantage in zip(row_indices, compute_group_advantages(group_rewards), strict=True):
                 advantages_by_row[row_idx] = float(advantage)
         for row_idx, (tokens, response_mask, loss_mask, logprobs, reward) in enumerate(
@@ -440,6 +487,7 @@ class PolicyOnlyTrainer:
                     logprobs=logprobs,
                     advantages=advantages,
                     reward=float(reward),
+                    transformed_reward=transformed_rewards[row_idx] if reward_transform_enabled else None,
                     eos_token_id=tokenizer.eos_token_id,
                 )
             )
@@ -511,9 +559,12 @@ class PolicyOnlyTrainer:
 
         Steps:
             1. Decode each completion and score it with `reward_fn`.
-            2. Standardise rewards within each prompt group to get advantages
-               (`compute_group_advantages`); this is the GRPO/GSPO baseline.
-            3. Stitch each prompt prefix with its response tokens and copy the
+            2. Optionally clip/standardize the batch-wide reward distribution
+               (`_transform_batch_rewards`) before advantage computation.
+            3. Standardise the (possibly transformed) rewards within each prompt
+               group to get advantages (`compute_group_advantages`); this is the
+               GRPO/GSPO baseline.
+            4. Stitch each prompt prefix with its response tokens and copy the
                group-level advantage onto every response position; prompt
                positions carry zero advantage and zero logprob.
         """
@@ -522,8 +573,11 @@ class PolicyOnlyTrainer:
         from areno.api.rewards import compute_group_advantages, make_reward_record
 
         train_batch = []
-        rewards_all = []
         rollout_logprobs = []
+        # Pass 1: score rewards per prompt group and remember the slice offsets
+        # so the batch-wide transform can be sliced back per group afterwards.
+        groups: list[tuple[object, object, list[float]]] = []
+        rewards_all: list[float] = []
         for item_idx, (item, result) in enumerate(zip(prompt_batch.items, rollout_results, strict=True)):
             prefix_len = len(item.input_tokens)
             completions = [tokenizer.decode(seq.resp_tokens) for seq in result.sequences]
@@ -544,11 +598,26 @@ class PolicyOnlyTrainer:
                 )
                 for sample_idx, (completion, seq) in enumerate(zip(completions, result.sequences, strict=True))
             ]
+            groups.append((item, result, rewards))
             rewards_all += rewards
+        # Reward shaping (clip/standardize) runs once over the whole batch,
+        # before the per-group standardisation that produces advantages.
+        transformed_rewards, _, reward_transform_enabled = self._transform_batch_rewards(rewards_all)
+        # Pass 2: derive group-relative advantages from the transformed slices
+        # and stamp each TrainSequence with raw (and, when enabled, transformed)
+        # reward so metrics keep the two distributions separate.
+        offset = 0
+        for item, result, rewards in groups:
+            count = len(rewards)
+            group_transformed = transformed_rewards[offset : offset + count]
+            offset += count
+            prefix_len = len(item.input_tokens)
             # Group-relative advantage: A_i = (r_i - mean(r))/std(r); shared by
             # every response token of sample i.
-            advantages = compute_group_advantages(rewards)
-            for seq, advantage, reward in zip(result.sequences, advantages, rewards, strict=True):
+            advantages = compute_group_advantages(group_transformed)
+            for seq, advantage, reward, transformed_reward in zip(
+                result.sequences, advantages, rewards, group_transformed, strict=True
+            ):
                 resp_len = len(seq.resp_tokens)
                 rollout_logprobs += seq.resp_logprobs
                 train_batch.append(
@@ -561,6 +630,7 @@ class PolicyOnlyTrainer:
                         logprobs=[0.0] * prefix_len + seq.resp_logprobs,
                         advantages=[0.0] * prefix_len + [advantage] * resp_len,
                         reward=reward,
+                        transformed_reward=transformed_reward if reward_transform_enabled else None,
                         eos_token_id=tokenizer.eos_token_id,
                     )
                 )

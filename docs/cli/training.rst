@@ -196,6 +196,61 @@ Reward files should expose:
 ``--reward-ckpt TEXT``
    Optional PPO reward model checkpoint path or remote model repo ID.
 
+``--reward-transform-mode [disabled|clip|standardize]``
+   Shape the raw reward distribution **after** scoring and **before**
+   group-relative advantage computation. Defaults to ``disabled`` (a numerical
+   no-op that preserves historic GSPO/GRPO behavior). Supported only with
+   ``--algo gspo`` and ``--algo grpo`` (PPO keeps its own GAE reward shaping;
+   SFT/DPO carry no rewards).
+
+   * ``clip`` clamps every reward into ``[--reward-clip-min, --reward-clip-max]``.
+   * ``standardize`` applies a per-batch z-score ``(r - mean) / (std + eps)``
+     across the whole rollout batch.
+
+   Raw and transformed reward distributions are reported separately: the
+   ``rollout/rewards_*`` TensorBoard scalars keep the unshaped signal, while
+   ``rollout/transformed_reward_*`` scalars and a per-step
+   ``stage=reward_transform`` log line describe the distribution actually fed
+   into advantage computation.
+
+``--reward-clip-min FLOAT`` / ``--reward-clip-max FLOAT``
+   Lower/upper bound for ``--reward-transform-mode clip``. Both are required
+   when the mode is ``clip``; ``--reward-clip-min`` must be ``<=`` (and both
+   must be finite) compared to ``--reward-clip-max``. Setting either bound while
+   the mode is ``disabled`` is rejected.
+
+``--reward-transform-eps FLOAT``
+   Epsilon added to the standard deviation for ``--reward-transform-mode
+   standardize``. Must be a positive finite number. Defaults to ``1e-8``.
+
+Example — clamp a noisy verifier to a fixed range before GRPO advantages:
+
+.. code-block:: bash
+
+   areno train --ckpt Qwen/Qwen3-0.6B --dataset-path gsm8k:main \
+     --reward-fn-path examples/math/math_verify_reward.py --algo grpo \
+     --reward-transform-mode clip --reward-clip-min -1.0 --reward-clip-max 1.0 \
+     --tp-size 4
+
+Example — standardize the batch reward distribution:
+
+.. code-block:: bash
+
+   areno train --ckpt Qwen/Qwen3-0.6B --dataset-path gsm8k:main \
+     --reward-fn-path examples/math/math_verify_reward.py --algo gspo \
+     --reward-transform-mode standardize --tp-size 4
+
+Limitations:
+
+* The transform applies only to the GSPO/GRPO policy-only advantage path.
+  PPO, SFT, and DPO are rejected at validation time when a non-disabled mode is
+  requested, so unsupported algorithms never silently ignore the option.
+* Non-finite rewards (``NaN``/``inf``) from ``reward_fn`` raise a clear
+  ``ValueError`` naming the offending index rather than producing ``NaN``
+  advantages; enable ``clip`` to sanitize a noisy verifier.
+* ``standardize`` operates per rollout batch; across tensor-parallel ranks each
+  rank shapes its own shard, so the reported distribution is rank-local.
+
 Parameter tuning
 ~~~~~~~~~~~~~~~~
 

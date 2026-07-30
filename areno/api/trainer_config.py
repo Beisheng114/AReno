@@ -145,6 +145,30 @@ class PolicyTrainerConfig(RolloutTrainerConfig):
     reward_fn_path: str | None = None
     gspo_clip_eps: float = 3.0e-4
     grpo_clip_eps: float = 0.2
+    # Reward distribution shaping applied after raw reward scoring and before
+    # group-relative advantage computation. The default ('disabled') preserves
+    # the historic GRPO/GSPO behavior exactly.
+    reward_transform_mode: str = "disabled"
+    reward_clip_min: float | None = None
+    reward_clip_max: float | None = None
+    reward_transform_eps: float = 1e-8
+
+    def reward_transform_config(self):
+        """Build a validated :class:`~areno.api.reward_transform.RewardTransformConfig`.
+
+        Construction runs the config's validator, so calling this during CLI
+        preflight surfaces invalid reward-transform inputs before any model or
+        worker initialization.
+        """
+
+        from areno.api.reward_transform import RewardTransformConfig
+
+        return RewardTransformConfig(
+            mode=self.reward_transform_mode,
+            clip_min=self.reward_clip_min,
+            clip_max=self.reward_clip_max,
+            eps=self.reward_transform_eps,
+        )
 
 
 @dataclass(slots=True)

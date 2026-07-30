@@ -92,6 +92,10 @@ TRAIN_OPTION_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "train_tool_results",
             "reward_fn_path",
             "reward_ckpt",
+            "reward_transform_mode",
+            "reward_clip_min",
+            "reward_clip_max",
+            "reward_transform_eps",
         ),
     ),
     (
@@ -273,8 +277,42 @@ def _trainer_config_from_options(**options) -> TrainerConfig:
         _require_positive_float(args.lam, "--lam")
     if args.critic_warmup_steps < 0:
         raise click.UsageError("--critic-warmup-steps must be non-negative")
+    _validate_reward_transform(args, algorithm)
     _preflight_task_hooks(args, algorithm)
     return _trainer_config_from_args(args)
+
+
+def _validate_reward_transform(args, algorithm) -> None:
+    """Validate reward-transform inputs before any model or worker init.
+
+    The transform only feeds the GSPO/GRPO advantage path; PPO overrides batch
+    assembly with its own GAE shaping and SFT/DPO carry no rewards, so a
+    non-disabled mode is rejected upfront rather than silently ignored. Uses
+    ``getattr`` defaults so callers (and tests) that omit the options keep the
+    historic disabled behavior.
+    """
+
+    mode = getattr(args, "reward_transform_mode", "disabled")
+    clip_min = getattr(args, "reward_clip_min", None)
+    clip_max = getattr(args, "reward_clip_max", None)
+    if mode == "disabled":
+        if clip_min is not None or clip_max is not None:
+            raise click.UsageError("--reward-clip-min/--reward-clip-max require --reward-transform-mode clip")
+        return
+    if algorithm.name not in {"gspo", "grpo"}:
+        raise click.UsageError(
+            f"--reward-transform-mode {mode} is supported with --algo gspo or --algo grpo only"
+        )
+    eps = getattr(args, "reward_transform_eps", 1e-8)
+    if eps is None or eps <= 0 or eps != eps or eps in (float("inf"), float("-inf")):
+        raise click.UsageError("--reward-transform-eps must be a positive finite number")
+    if mode == "clip":
+        if clip_min is None or clip_max is None:
+            raise click.UsageError("--reward-transform-mode clip requires both --reward-clip-min and --reward-clip-max")
+        if clip_min > clip_max:
+            raise click.UsageError("--reward-clip-min must be <= --reward-clip-max")
+        if clip_min in (float("inf"), float("-inf")) or clip_max in (float("inf"), float("-inf")):
+            raise click.UsageError("--reward-clip-min and --reward-clip-max must be finite")
 
 
 def _require_positive_float(value: float, option_name: str) -> None:
@@ -314,6 +352,7 @@ def _format_training_config_summary(
                     _format_optional(config.reward_fn_path) if isinstance(config, PolicyTrainerConfig) else "n/a",
                 ),
                 ("reward_ckpt", _format_optional(_reward_ckpt_for_summary(config, reward_ckpt))),
+                ("reward_shape", _reward_transform_summary(config)),
                 ("agent_fn", _format_optional(config.agent_fn)),
             ],
         ),
@@ -463,6 +502,19 @@ def _reward_ckpt_for_summary(config: TrainerConfig, reward_ckpt: str | None) -> 
     return reward_ckpt
 
 
+def _reward_transform_summary(config: TrainerConfig) -> str:
+    # Non-policy configs (SFT/DPO) never carry rewards, so the field is shown
+    # as not-applicable there; policy configs always expose the field.
+    if not isinstance(config, PolicyTrainerConfig):
+        return "n/a"
+    mode = config.reward_transform_mode
+    if mode == "disabled":
+        return "disabled"
+    if mode == "clip":
+        return f"clip[{config.reward_clip_min}, {config.reward_clip_max}]"
+    return f"standardize(eps={config.reward_transform_eps})"
+
+
 def _resolved_attn_backend_for_summary(
     config: TrainerConfig, *, model_config: ModelConfig | None = None
 ) -> tuple[str, str | None]:
@@ -598,6 +650,10 @@ def _trainer_config_from_args(args) -> TrainerConfig:
     args.max_steps = getattr(args, "max_steps", None)
     args.score_micro_bs = getattr(args, "score_micro_bs", 8)
     args.model_hub = getattr(args, "model_hub", "modelscope")
+    args.reward_transform_mode = getattr(args, "reward_transform_mode", "disabled")
+    args.reward_clip_min = getattr(args, "reward_clip_min", None)
+    args.reward_clip_max = getattr(args, "reward_clip_max", None)
+    args.reward_transform_eps = getattr(args, "reward_transform_eps", 1e-8)
     algorithm = get_algorithm(args.algo)
     chat_template_enable_thinking = False if args.disable_thinking else None
     if algorithm.name == "dpo":
@@ -727,6 +783,10 @@ def _trainer_config_from_args(args) -> TrainerConfig:
             agent_timeout_s=args.agent_timeout_s,
             train_tool_results=args.train_tool_results,
             chat_template_enable_thinking=chat_template_enable_thinking,
+            reward_transform_mode=args.reward_transform_mode,
+            reward_clip_min=args.reward_clip_min,
+            reward_clip_max=args.reward_clip_max,
+            reward_transform_eps=args.reward_transform_eps,
         )
     return PPOTrainerConfig(
         algo=algorithm.name,
@@ -770,6 +830,10 @@ def _trainer_config_from_args(args) -> TrainerConfig:
         gspo_clip_eps=args.gspo_clip_eps,
         grpo_clip_eps=args.grpo_clip_eps,
         metrics_log_dir=args.metrics_log_dir,
+        reward_transform_mode=args.reward_transform_mode,
+        reward_clip_min=args.reward_clip_min,
+        reward_clip_max=args.reward_clip_max,
+        reward_transform_eps=args.reward_transform_eps,
         ref_ckpt=args.ref_ckpt,
         reward_ckpt=args.reward_ckpt,
         critic_ckpt=args.critic_ckpt,
@@ -904,6 +968,10 @@ def _training_config_settings(config: TrainerConfig) -> dict:
                 "train_tool_results",
                 "reward_fn_path",
                 "reward_ckpt",
+                "reward_transform_mode",
+                "reward_clip_min",
+                "reward_clip_max",
+                "reward_transform_eps",
             ],
         ),
         section(
@@ -1182,6 +1250,32 @@ def _dataset_builder_for_suffix(suffix: str) -> str:
     "--ref-ckpt", default=None, help="Optional PPO/DPO reference model checkpoint path or remote model repo ID."
 )
 @click.option("--reward-ckpt", default=None, help="Optional PPO reward model checkpoint path or remote model repo ID.")
+@click.option(
+    "--reward-transform-mode",
+    type=click.Choice(["disabled", "clip", "standardize"], case_sensitive=False),
+    default="disabled",
+    show_default=True,
+    help="Shape the reward distribution after scoring and before advantage computation: disabled (no-op), clip (clamp to [clip-min, clip-max]), or standardize (per-batch z-score). GSPO/GRPO only.",
+)
+@click.option(
+    "--reward-clip-min",
+    type=float,
+    default=None,
+    help="Lower bound for --reward-transform-mode clip.",
+)
+@click.option(
+    "--reward-clip-max",
+    type=float,
+    default=None,
+    help="Upper bound for --reward-transform-mode clip.",
+)
+@click.option(
+    "--reward-transform-eps",
+    type=float,
+    default=1e-8,
+    show_default=True,
+    help="Epsilon added to std for --reward-transform-mode standardize.",
+)
 @click.option("--critic-ckpt", default=None, help="Optional PPO critic model checkpoint path or remote model repo ID.")
 @click.option("--save-path", default=None, help="Optional checkpoint output directory.")
 @click.option("--save-interval", type=int, default=100, show_default=True, help="Save checkpoint every N train steps.")

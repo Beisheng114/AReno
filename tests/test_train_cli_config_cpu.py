@@ -626,6 +626,132 @@ def test_train_help_remains_complete_and_groups_every_declared_option():
             assert record[0].split()[0].rstrip(",") in output, f"option dropped from help: {param.name}"
 
 
+def test_train_config_reward_transform_disabled_by_default():
+    cfg = _trainer_config_from_options(**_options(algo="gspo"))
+
+    assert isinstance(cfg, PolicyTrainerConfig)
+    assert cfg.reward_transform_mode == "disabled"
+    assert cfg.reward_transform_config().mode == "disabled"
+    assert cfg.reward_transform_config().enabled is False
+
+
+def test_train_config_reward_transform_clip_requires_both_bounds():
+    with pytest.raises(UsageError, match="requires both --reward-clip-min and --reward-clip-max"):
+        _trainer_config_from_options(
+            **_options(algo="gspo", reward_transform_mode="clip", reward_clip_min=0.0)
+        )
+
+
+def test_train_config_reward_transform_clip_rejects_inverted_bounds():
+    with pytest.raises(UsageError, match="--reward-clip-min must be <= --reward-clip-max"):
+        _trainer_config_from_options(
+            **_options(
+                algo="gspo",
+                reward_transform_mode="clip",
+                reward_clip_min=5.0,
+                reward_clip_max=1.0,
+            )
+        )
+
+
+def test_train_config_reward_transform_clip_bounds_without_mode_rejected():
+    with pytest.raises(UsageError, match="require --reward-transform-mode clip"):
+        _trainer_config_from_options(**_options(algo="gspo", reward_clip_min=0.0))
+
+
+def test_train_config_reward_transform_rejected_for_ppo():
+    with pytest.raises(UsageError, match="supported with --algo gspo or --algo grpo only"):
+        _trainer_config_from_options(
+            **_options(algo="ppo", reward_transform_mode="standardize")
+        )
+
+
+def test_train_config_reward_transform_rejected_for_sft():
+    with pytest.raises(UsageError, match="supported with --algo gspo or --algo grpo only"):
+        _trainer_config_from_options(
+            **_options(
+                algo="sft",
+                reward_transform_mode="clip",
+                reward_clip_min=0.0,
+                reward_clip_max=1.0,
+            )
+        )
+
+
+def test_train_config_builds_policy_reward_transform_clip_shape():
+    cfg = _trainer_config_from_options(
+        **_options(
+            algo="gspo",
+            reward_transform_mode="clip",
+            reward_clip_min=-1.0,
+            reward_clip_max=1.0,
+            reward_transform_eps=1e-6,
+        )
+    )
+
+    rt = cfg.reward_transform_config()
+    assert rt.mode == "clip"
+    assert rt.clip_min == -1.0
+    assert rt.clip_max == 1.0
+    assert rt.eps == 1e-6
+    assert rt.enabled is True
+
+
+def test_training_config_summary_shows_reward_transform():
+    cfg = _trainer_config_from_options(
+        **_options(
+            algo="gspo",
+            reward_transform_mode="clip",
+            reward_clip_min=-1.0,
+            reward_clip_max=1.0,
+        )
+    )
+
+    summary = _format_training_config_summary(cfg)
+
+    assert "reward_shape    clip[-1.0, 1.0]" in summary
+
+
+def test_training_config_summary_marks_reward_transform_not_applicable_for_sft():
+    cfg = _trainer_config_from_options(**_options(algo="sft", reward_fn_path=None, reward_ckpt=None))
+
+    assert "reward_shape    n/a" in _format_training_config_summary(cfg)
+
+
+def test_train_config_reward_transform_rejects_non_positive_eps():
+    with pytest.raises(UsageError, match="--reward-transform-eps must be a positive finite number"):
+        _trainer_config_from_options(
+            **_options(algo="gspo", reward_transform_mode="standardize", reward_transform_eps=0.0)
+        )
+
+
+def test_train_config_reward_transform_rejects_nan_eps():
+    with pytest.raises(UsageError, match="--reward-transform-eps must be a positive finite number"):
+        _trainer_config_from_options(
+            **_options(algo="gspo", reward_transform_mode="standardize", reward_transform_eps=float("nan"))
+        )
+
+
+def test_train_config_reward_transform_clip_rejects_non_finite_bounds():
+    with pytest.raises(UsageError, match="--reward-clip-min and --reward-clip-max must be finite"):
+        _trainer_config_from_options(
+            **_options(
+                algo="gspo",
+                reward_transform_mode="clip",
+                reward_clip_min=float("-inf"),
+                reward_clip_max=1.0,
+            )
+        )
+
+
+def test_training_config_summary_shows_reward_transform_standardize():
+    cfg = _trainer_config_from_options(
+        **_options(algo="gspo", reward_transform_mode="standardize", reward_transform_eps=1e-6)
+    )
+
+    assert "reward_shape    standardize(eps=1e-06)" in _format_training_config_summary(cfg)
+
+
 def _options(**overrides):
     defaults = dict(
         algo="gspo",
@@ -676,6 +802,10 @@ def _options(**overrides):
         train_tool_results=False,
         gspo_clip_eps=3.0e-4,
         grpo_clip_eps=0.2,
+        reward_transform_mode="disabled",
+        reward_clip_min=None,
+        reward_clip_max=None,
+        reward_transform_eps=1e-8,
         ref_ckpt=None,
         dpo_beta=0.1,
         reward_ckpt="reward-model",
